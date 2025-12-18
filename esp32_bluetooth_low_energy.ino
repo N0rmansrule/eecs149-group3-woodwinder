@@ -12,8 +12,10 @@ static const uint8_t PURPLE_G = 0;
 static const uint8_t PURPLE_B = 255;
 
 // ---------- UART to UNO (SoftwareSerial on UNO: Link(12, 11)) ----------
+// UNO RX = D12  <-- ESP32 TX (GPIO17)
+// UNO TX = D11  --> ESP32 RX (GPIO27)  NOTE: level-shift UNO->ESP32 (5V to 3.3V)
 static const int ESP32_TX = 17;   // -> UNO D12 (RX)
-static const int ESP32_RX = 27;   // <- UNO D11 (TX)  (level shift UNO->ESP32!)
+static const int ESP32_RX = 27;   // <- UNO D11 (TX)
 static const uint32_t LINK_BAUD = 9600;
 
 // ---------- BLE NUS ----------
@@ -63,7 +65,7 @@ void sendToBLE(const char* message) {
 }
 
 static void sendBleStatusToUNO() {
-  // Line-based so UNO can parse easily
+  // Line-based so UNO can parse
   Serial2.println(bleConnected ? "BLE:1" : "BLE:0");
 }
 
@@ -160,13 +162,13 @@ void setup() {
   svc->start();
   startAdvertising();
 
-  // ensure UNO starts with correct status
+  // Force initial status to UNO
   bleConnected = false;
   sendBleStatusToUNO();
 
   Serial.print("BLE Name: ");
   Serial.println(BLE_NAME);
-  Serial.println("ESP32 Serial Monitor OR BLE -> forwarded to UNO.");
+  Serial.println("ESP32 USB Serial OR BLE -> forwarded to UNO.");
   Serial.println("Commands: PAUSE / RESUME / 1 / 0 / etc.");
 }
 
@@ -195,7 +197,7 @@ void loop() {
       if (unoBuffer.length() > 0) {
         unoBuffer.trim();
 
-        // If UNO tells us 1/0, reflect it on NeoPixel too
+        // Reflect 1/0 from UNO on NeoPixel too (if UNO ever sends them as lines)
         if (unoBuffer == "1") setPurple(true);
         else if (unoBuffer == "0") setPurple(false);
 

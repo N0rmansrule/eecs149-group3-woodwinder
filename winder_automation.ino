@@ -20,8 +20,8 @@ static State pausedState = STOP_FWD;
 
 // -------------------- BLE STATUS FLAG (from ESP32) --------------------
 static bool bleConnectedFlag = false;
-static int lastShownBle = -1;       // for LCD refresh
-static int lastShownPaused = -1;    // for LCD refresh
+static int lastShownBle = -1;
+static int lastShownPaused = -1;
 
 // -------------------- LCD --------------------
 #define LCD_ADDR 0x27
@@ -42,8 +42,9 @@ const int ledPin = 13;
 const int ratio_num = 5;
 long ratio_acc = 0;
 
-const unsigned long stepRate = 2000;      // microseconds per step
-const unsigned int  stepPulseUs = 3;      // microseconds HIGH pulse width
+// ✅ Reverted speed (stable)
+const unsigned long stepRate = 1200;     // microseconds per step
+const unsigned int  stepPulseUs = 3;     // microseconds HIGH pulse width
 unsigned long lastStepTime = 0;
 
 const unsigned long sensorInterval = 1000; // ms
@@ -53,6 +54,9 @@ unsigned long previousSensorMillis = 0;
 float dist_cm = 0.0;
 long  dist_mm = 0;
 long  lastShownDistMm = -1;
+
+// reduce blocking a bit (optional but safe)
+const unsigned long echoTimeoutUs = 8000; // ~1.3m, plenty
 
 // -------------------- RESET DISPLAY/LOGIC LOCKOUT --------------------
 const unsigned long resetLockoutMs = 500;
@@ -130,7 +134,6 @@ void lcdUpdateIfChanged() {
   if (dist_mm != lastShownDistMm || bNow != lastShownBle || pNow != lastShownPaused) {
     lcd.setCursor(0, 1);
 
-    // Format fits 16 chars reliably: "D:9999mm B1 P0"
     lcd.print("D:");
     lcd.print(dist_mm);
     lcd.print("mm ");
@@ -142,8 +145,7 @@ void lcdUpdateIfChanged() {
     lcd.print("P");
     lcd.print(pNow);
 
-    // clear remaining chars
-    int used = 2 + numDigitsLong(dist_mm) + 2 + 1 + 2 + 1 + 2; // D: + digits + mm + space + B# + space + P#
+    int used = 2 + numDigitsLong(dist_mm) + 2 + 1 + 2 + 1 + 2;
     for (int i = used; i < 16; i++) lcd.print(' ');
 
     lastShownDistMm = dist_mm;
@@ -161,14 +163,20 @@ void forceResetToBackward() {
 }
 
 float getDistanceCm() {
+  static float lastGood = 0.0f;
+
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
 
-  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
-  return (duration * 0.0343f) / 2.0f;
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, echoTimeoutUs);
+  if (duration == 0) return lastGood;
+
+  float cm = (duration * 0.0343f) / 2.0f;
+  lastGood = cm;
+  return cm;
 }
 
 static inline void pulseStepPin(int pin) {
@@ -221,7 +229,7 @@ static void doPause() {
   isPaused = true;
   pausedState = state;
   sendToESP32Line("PAUSED");
-  lcdUpdateIfChanged(); // refresh P flag
+  lcdUpdateIfChanged();
 }
 
 static void doResume() {
@@ -231,7 +239,7 @@ static void doResume() {
   lastStepTime = micros();
   sendToESP32Line("RESUMED");
   reportStateToESP32IfChanged();
-  lcdUpdateIfChanged(); // refresh P flag
+  lcdUpdateIfChanged();
 }
 
 // ==================== COMMANDS FROM ESP32 ====================
@@ -242,7 +250,7 @@ static void handleCommandFromESP32(const char* lineRaw) {
   trimInPlace(line);
   if (line[0] == '\0') return;
 
-  // handle BLE status messages (BLE:1 / BLE:0) regardless of pause
+  // BLE status messages (BLE:1 / BLE:0)
   if (strncmp(line, "BLE:", 4) == 0) {
     char v = line[4];
     bleConnectedFlag = (v == '1');
@@ -262,11 +270,10 @@ static void handleCommandFromESP32(const char* lineRaw) {
   if (strcmp(cmd, "1") == 0) { digitalWrite(ledPin, HIGH); return; }
   if (strcmp(cmd, "0") == 0) { digitalWrite(ledPin, LOW);  return; }
 
-  // PAUSE/RESUME must work anytime
+  // PAUSE/RESUME anytime
   if (strcmp(cmd, "PAUSE") == 0)  { doPause();  return; }
   if (strcmp(cmd, "RESUME") == 0) { doResume(); return; }
 
-  // If paused: ignore other motion/state commands until RESUME or button
   if (isPaused) return;
 
   if (strcmp(cmd, "START_FORWARD") == 0) {
@@ -341,12 +348,13 @@ static void pollUsbToEsp32() {
   }
 }
 
+// ✅ FIXED: only treat '1'/'0' as single-byte when they arrive alone (buffer empty)
 static void pollEsp32ToUno() {
   while (Link.available()) {
     char c = (char)Link.read();
 
-    // ESP32 may send single-byte '1'/'0' without newline
-    if (c == '1' || c == '0') {
+    // Single-byte '1'/'0' support (only if NOT in the middle of a line)
+    if ((c == '1' || c == '0') && linkLen == 0) {
       char tmp[2] = { c, '\0' };
       handleCommandFromESP32(tmp);
       continue;
@@ -365,7 +373,7 @@ static void pollEsp32ToUno() {
 }
 
 static void pollButtonEvent() {
-  bool level = (digitalRead(buttonPin) == HIGH); // HIGH idle, LOW pressed
+  bool level = (digitalRead(buttonPin) == HIGH);
   unsigned long nowMs = millis();
 
   if (lastButtonLevel == HIGH && level == LOW) {
@@ -421,7 +429,6 @@ void loop() {
   pollEsp32ToUno();
   pollButtonEvent();
 
-  // If paused: freeze machine, but still allow BLE status updates + button unpause
   if (isPaused) {
     if (buttonEvent) {
       buttonEvent = false;
@@ -443,7 +450,6 @@ void loop() {
     return;
   }
 
-  // Normal button behavior
   if (buttonEvent) {
     buttonEvent = false;
     unsigned long nowMs = millis();
@@ -465,7 +471,6 @@ void loop() {
     return;
   }
 
-  // Periodic distance read
   unsigned long currentMillis = millis();
   if (currentMillis - previousSensorMillis >= sensorInterval) {
     previousSensorMillis = currentMillis;
@@ -475,7 +480,6 @@ void loop() {
     lcdUpdateIfChanged();
   }
 
-  // State machine based on distance
   State prevState = state;
 
   switch (state) {
@@ -497,7 +501,6 @@ void loop() {
     reportStateToESP32IfChanged();
   }
 
-  // Stepping
   if (state == RUN_FWD || state == RUN_BWD) {
     unsigned long now = micros();
     if (now - lastStepTime >= stepRate) {
