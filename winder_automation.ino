@@ -42,10 +42,17 @@ const int ledPin = 13;
 const int ratio_num = 5;
 long ratio_acc = 0;
 
-// ✅ Reverted speed (stable)
-const unsigned long stepRate = 1200;     // microseconds per step
-const unsigned int  stepPulseUs = 3;     // microseconds HIGH pulse width
+// ======= SPEED CONTROL (FASTER BUT STABLE) =======
+// Lower = faster. Ramp prevents stalls at start.
+static const unsigned long STEP_RATE_SLOW = 1500; // us/step when starting to run
+static const unsigned long STEP_RATE_FAST = 1000; // us/step target (try 950, then 900 if stable)
+static const unsigned long RAMP_MS        = 600;  // ramp duration
+
+static const unsigned int  stepPulseUs = 2;       // HIGH pulse width (>=2us is safe for most drivers)
 unsigned long lastStepTime = 0;
+
+static unsigned long runStartMs = 0;
+static bool wasRunning = false;
 
 const unsigned long sensorInterval = 1000; // ms
 unsigned long previousSensorMillis = 0;
@@ -55,8 +62,9 @@ float dist_cm = 0.0;
 long  dist_mm = 0;
 long  lastShownDistMm = -1;
 
-// reduce blocking a bit (optional but safe)
-const unsigned long echoTimeoutUs = 8000; // ~1.3m, plenty
+// For your 4–9cm thresholds, echo is ~250–600us.
+// Smaller timeout = less blocking = smoother + faster stepping.
+const unsigned long echoTimeoutUs = 3000;
 
 // -------------------- RESET DISPLAY/LOGIC LOCKOUT --------------------
 const unsigned long resetLockoutMs = 500;
@@ -112,6 +120,26 @@ static void toUpperInPlace(char* s) {
   }
 }
 
+// Compute ramped step interval while RUNning
+static inline unsigned long currentStepIntervalUs() {
+  bool running = (state == RUN_FWD || state == RUN_BWD);
+
+  if (running && !wasRunning) {
+    runStartMs = millis();
+  }
+  if (!running) {
+    wasRunning = false;
+    return STEP_RATE_SLOW;
+  }
+  wasRunning = true;
+
+  unsigned long elapsed = millis() - runStartMs;
+  if (elapsed >= RAMP_MS) return STEP_RATE_FAST;
+
+  unsigned long diff = STEP_RATE_SLOW - STEP_RATE_FAST;
+  return STEP_RATE_SLOW - (diff * elapsed) / RAMP_MS;
+}
+
 void lcdUpdateIfChanged() {
   // Line 1: State
   if (state != lastShownState) {
@@ -159,6 +187,7 @@ void forceResetToBackward() {
   digitalWrite(dirPin2, LOW);
   ratio_acc = 0;
   lastStepTime = micros();
+  runStartMs = millis();
   state = RUN_BWD;
 }
 
@@ -237,6 +266,7 @@ static void doResume() {
   isPaused = false;
   state = pausedState;
   lastStepTime = micros();
+  runStartMs = millis();   // ramp again on resume
   sendToESP32Line("RESUMED");
   reportStateToESP32IfChanged();
   lcdUpdateIfChanged();
@@ -266,11 +296,9 @@ static void handleCommandFromESP32(const char* lineRaw) {
   Serial.print("[ESP32->UNO] ");
   Serial.println(line);
 
-  // Always allow LED commands even while paused
   if (strcmp(cmd, "1") == 0) { digitalWrite(ledPin, HIGH); return; }
   if (strcmp(cmd, "0") == 0) { digitalWrite(ledPin, LOW);  return; }
 
-  // PAUSE/RESUME anytime
   if (strcmp(cmd, "PAUSE") == 0)  { doPause();  return; }
   if (strcmp(cmd, "RESUME") == 0) { doResume(); return; }
 
@@ -282,6 +310,7 @@ static void handleCommandFromESP32(const char* lineRaw) {
     state = RUN_FWD;
     resetLockoutUntil = 0;
     lastStepTime = micros();
+    runStartMs = millis();
 
     lastShownState = (State)(-1);
     lcdUpdateIfChanged();
@@ -348,12 +377,11 @@ static void pollUsbToEsp32() {
   }
 }
 
-// ✅ FIXED: only treat '1'/'0' as single-byte when they arrive alone (buffer empty)
+// ✅ FIXED: only treat '1'/'0' as single-byte when buffer empty
 static void pollEsp32ToUno() {
   while (Link.available()) {
     char c = (char)Link.read();
 
-    // Single-byte '1'/'0' support (only if NOT in the middle of a line)
     if ((c == '1' || c == '0') && linkLen == 0) {
       char tmp[2] = { c, '\0' };
       handleCommandFromESP32(tmp);
@@ -420,7 +448,9 @@ void setup() {
 
   sendToESP32Line("UNO_READY");
   reportStateToESP32IfChanged();
+
   lastStepTime = micros();
+  runStartMs = millis();
 }
 
 // -------------------- LOOP --------------------
@@ -463,6 +493,7 @@ void loop() {
       state = RUN_FWD;
       resetLockoutUntil = 0;
       lastStepTime = micros();
+      runStartMs = millis();
     }
 
     lastShownState = (State)(-1);
@@ -499,14 +530,29 @@ void loop() {
     lastShownState = (State)(-1);
     lcdUpdateIfChanged();
     reportStateToESP32IfChanged();
+
+    if (state == RUN_FWD || state == RUN_BWD) {
+      runStartMs = millis();
+      lastStepTime = micros();
+    }
   }
 
+  // Stepping (faster + ramped)
   if (state == RUN_FWD || state == RUN_BWD) {
+    unsigned long interval = currentStepIntervalUs();
     unsigned long now = micros();
-    if (now - lastStepTime >= stepRate) {
-      lastStepTime += stepRate;
+
+    // Catch-up a little if something blocks briefly (prevents slowdowns)
+    // Limit to avoid huge bursts
+    uint8_t maxSteps = 4;
+    while ((long)(now - lastStepTime) >= (long)interval && maxSteps--) {
+      lastStepTime += interval;
+
       if (state == RUN_FWD) stepOnceAandRatio();
       else                 stepOnceAandRatio_linear();
+
+      now = micros();
+      interval = currentStepIntervalUs();
     }
   }
 }
