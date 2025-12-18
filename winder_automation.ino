@@ -1,63 +1,78 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include <string.h>
 #include <SoftwareSerial.h>
 
-LiquidCrystal_I2C lcd(0x27, 16, 2);
-SoftwareSerial Link(12, 11);
+// ==================== ESP32 LINK (UART via SoftwareSerial) ====================
+SoftwareSerial Link(12, 11);   // UNO RX=D12, UNO TX=D11
+const uint32_t LINK_BAUD = 9600;
 
-enum State {
-  STOP_FWD,
-  RUN_FWD,
-  STOP_BWD,
-  RUN_BWD
-};
+// -------------------- STATE --------------------
+enum State { STOP_FWD, RUN_FWD, STOP_BWD, RUN_BWD };
 
 State state = STOP_FWD;
+State lastShownState = (State)(-1);
+State lastReportedStateToESP32 = (State)(-1);
 
-const int dirPin = 2;
-const int stepPin = 3;
-const int dirPin2 = 6;
+// -------------------- PAUSE CONTROL --------------------
+static bool isPaused = false;
+static State pausedState = STOP_FWD;
+
+// -------------------- BLE STATUS FLAG (from ESP32) --------------------
+static bool bleConnectedFlag = false;
+static int lastShownBle = -1;       // for LCD refresh
+static int lastShownPaused = -1;    // for LCD refresh
+
+// -------------------- LCD --------------------
+#define LCD_ADDR 0x27
+LiquidCrystal_I2C lcd(LCD_ADDR, 16, 2);
+
+// -------------------- PINS --------------------
+const int dirPin   = 2;
+const int stepPin  = 3;
+const int dirPin2  = 6;
 const int stepPin2 = 7;
 const int buttonPin = 8;
 
-// Ratio Logic
-const int ratio_num = 5;
-const int ratio_den = 1;
-long ratio_acc = 0;
-
-// Timing
-unsigned long lastStepTime = 0;
-const unsigned long stepRate = 100; // microseconds (lower = faster, 100 = 4x original speed)
-
 #define TRIG_PIN 4
 #define ECHO_PIN 5
-
 const int ledPin = 13;
 
-const unsigned long sensorInterval = 1000;
+// -------------------- RATIO / TIMING --------------------
+const int ratio_num = 5;
+long ratio_acc = 0;
 
+const unsigned long stepRate = 2000;      // microseconds per step
+const unsigned int  stepPulseUs = 3;      // microseconds HIGH pulse width
+unsigned long lastStepTime = 0;
+
+const unsigned long sensorInterval = 1000; // ms
 unsigned long previousSensorMillis = 0;
 
-float distance = 100;
-float dist = 0;
+// -------------------- DISTANCE --------------------
+float dist_cm = 0.0;
+long  dist_mm = 0;
+long  lastShownDistMm = -1;
 
-unsigned long lastBtn = 0;
-unsigned long lastBtnPressTime = 0;
-const unsigned long DOUBLE_PRESS_WINDOW = 500; // milliseconds for double press detection
+// -------------------- RESET DISPLAY/LOGIC LOCKOUT --------------------
+const unsigned long resetLockoutMs = 500;
+unsigned long resetLockoutUntil = 0;
 
-// ESP32 communication
-bool paused = false;
-bool emergencyStop = false;
-bool waitingForReset = false; // Waiting for button press to reset after error
-unsigned long lastBTTime = 0;
-const unsigned long BT_TIMEOUT = 3000; // Consider BT disconnected after 3 seconds
+// -------------------- BUTTON (polled debounce) --------------------
+bool buttonEvent = false;
+static bool lastButtonLevel = HIGH;
+static unsigned long lastButtonEdgeMs = 0;
+static const unsigned long buttonDebounceMs = 200;
 
-// Command buffer for receiving strings
-String cmdBuffer = "";
-const int MAX_CMD_LEN = 50;
+// -------------------- COMM BUFFERS --------------------
+static char usbBuf[80];
+static uint8_t usbLen = 0;
 
-// ---------------- LCD helpers ----------------
-const char* stateLabel(State s) {
+static char linkBuf[80];
+static uint8_t linkLen = 0;
+
+// -------------------- HELPERS --------------------
+const char* stateName(State s) {
   switch (s) {
     case STOP_FWD: return "STOP_FWD";
     case RUN_FWD:  return "RUN_FWD";
@@ -67,392 +82,428 @@ const char* stateLabel(State s) {
   }
 }
 
-void lcdPrintLine(uint8_t row, String text) {
-  if (text.length() > 16) text = text.substring(0, 16);
-  while (text.length() < 16) text += ' ';
-  lcd.setCursor(0, row);
-  lcd.print(text);
+int numDigitsLong(long v) {
+  if (v == 0) return 1;
+  int d = 0;
+  if (v < 0) { d++; v = -v; }
+  while (v > 0) { v /= 10; d++; }
+  return d;
 }
 
-void updateLCD() {
-  static State lastShown = (State)255;
-  static float lastDist = -1.0;
-  static bool lastBTStatus = false;
+static void trimInPlace(char* s) {
+  uint16_t i = 0;
+  while (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n') i++;
+  if (i > 0) memmove(s, s + i, strlen(s + i) + 1);
 
-  // Check Bluetooth connection status
-  bool btConnected = (millis() - lastBTTime) < BT_TIMEOUT;
-
-  // Update state line if state changed or BT status changed
-  if (state != lastShown || btConnected != lastBTStatus) {
-    String stateStr = String(stateLabel(state));
-    String btStr = btConnected ? "true" : "false";
-    String line0 = stateStr + " BT:" + btStr;
-    lcdPrintLine(0, line0);
-    lastShown = state;
-    lastBTStatus = btConnected;
-  }
-
-  // Update distance line if distance changed (with some threshold to avoid flicker)
-  if (abs(dist - lastDist) > 0.1) {
-    float dist_mm = dist * 10.0; // Convert cm to mm
-    lcdPrintLine(1, String("Dist: ") + String(dist_mm, 1) + " mm");
-    lastDist = dist;
+  int16_t end = (int16_t)strlen(s) - 1;
+  while (end >= 0 && (s[end] == ' ' || s[end] == '\t' || s[end] == '\r' || s[end] == '\n')) {
+    s[end] = '\0';
+    end--;
   }
 }
 
-// Button state tracking for double press detection
-static unsigned long firstPressTime = 0;
-static bool waitingForSecondPress = false;
-static bool pendingSinglePress = false;
-
-bool buttonPressed(){
-  unsigned long currentTime = millis();
-  
-  if(digitalRead(buttonPin)==LOW && millis()-lastBtn>200){
-    lastBtn = millis();
-    
-    if(waitingForSecondPress){
-      // Second press detected within window - double press!
-      if(currentTime - firstPressTime < DOUBLE_PRESS_WINDOW){
-        waitingForSecondPress = false;
-        firstPressTime = 0;
-        pendingSinglePress = false;
-        return false; // Don't treat as single press, it's a double press
-      }
-    }
-    
-    // First press or new press after timeout
-    firstPressTime = currentTime;
-    waitingForSecondPress = true;
-    pendingSinglePress = true;
-    return false; // Don't return true yet, wait to see if double press
+static void toUpperInPlace(char* s) {
+  for (uint16_t i = 0; s[i]; i++) {
+    if (s[i] >= 'a' && s[i] <= 'z') s[i] = (char)(s[i] - 32);
   }
-  
-  // Check if we've waited too long for second press - then it was a single press
-  if(waitingForSecondPress && pendingSinglePress && (currentTime - firstPressTime >= DOUBLE_PRESS_WINDOW)){
-    waitingForSecondPress = false;
-    firstPressTime = 0;
-    bool result = pendingSinglePress;
-    pendingSinglePress = false;
-    return result; // It was a single press
-  }
-  
-  return false;
 }
 
-bool isDoublePress(){
-  unsigned long currentTime = millis();
-  
-  if(digitalRead(buttonPin)==LOW && millis()-lastBtn>200){
-    if(waitingForSecondPress && (currentTime - firstPressTime < DOUBLE_PRESS_WINDOW)){
-      waitingForSecondPress = false;
-      firstPressTime = 0;
-      pendingSinglePress = false;
-      lastBtn = millis();
-      return true;
-    }
+void lcdUpdateIfChanged() {
+  // Line 1: State
+  if (state != lastShownState) {
+    const char* name = stateName(state);
+
+    lcd.setCursor(0, 0);
+    lcd.print("State: ");
+    lcd.print(name);
+
+    int used = 7 + (int)strlen(name);
+    for (int i = used; i < 16; i++) lcd.print(' ');
+
+    lastShownState = state;
   }
-  
-  return false;
+
+  // Line 2: Distance + flags (B/P)
+  int bNow = bleConnectedFlag ? 1 : 0;
+  int pNow = isPaused ? 1 : 0;
+
+  if (dist_mm != lastShownDistMm || bNow != lastShownBle || pNow != lastShownPaused) {
+    lcd.setCursor(0, 1);
+
+    // Format fits 16 chars reliably: "D:9999mm B1 P0"
+    lcd.print("D:");
+    lcd.print(dist_mm);
+    lcd.print("mm ");
+
+    lcd.print("B");
+    lcd.print(bNow);
+    lcd.print(" ");
+
+    lcd.print("P");
+    lcd.print(pNow);
+
+    // clear remaining chars
+    int used = 2 + numDigitsLong(dist_mm) + 2 + 1 + 2 + 1 + 2; // D: + digits + mm + space + B# + space + P#
+    for (int i = used; i < 16; i++) lcd.print(' ');
+
+    lastShownDistMm = dist_mm;
+    lastShownBle = bNow;
+    lastShownPaused = pNow;
+  }
 }
 
-float getDistance(){
-  unsigned long currentMillis = millis();
+void forceResetToBackward() {
+  digitalWrite(dirPin, LOW);
+  digitalWrite(dirPin2, LOW);
+  ratio_acc = 0;
+  lastStepTime = micros();
+  state = RUN_BWD;
+}
+
+float getDistanceCm() {
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
 
-  long duration = pulseIn(ECHO_PIN, HIGH);
-  distance = duration * 0.034 / 2;
-  Serial.print(distance);
-  Serial.println(" cm");
-  return distance;
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  return (duration * 0.0343f) / 2.0f;
 }
 
-void stepOnceAandRatio(){
-  // MAIN motor pulse
-  digitalWrite(stepPin, HIGH);
-  digitalWrite(stepPin, LOW);
+static inline void pulseStepPin(int pin) {
+  digitalWrite(pin, HIGH);
+  delayMicroseconds(stepPulseUs);
+  digitalWrite(pin, LOW);
+}
 
-  // ACCUMULATE
+void stepOnceAandRatio() {
+  pulseStepPin(stepPin);
+
   ratio_acc += 1;
-
-  while(ratio_acc >= ratio_num){
-    // RATIO motor step
-    digitalWrite(stepPin2, HIGH);
-    digitalWrite(stepPin2, LOW);
-
+  while (ratio_acc >= ratio_num) {
+    pulseStepPin(stepPin2);
     ratio_acc -= ratio_num;
   }
 }
 
-void stepOnceAandRatio_linear(){
-  // MAIN motor pulse
-  digitalWrite(stepPin, HIGH);
-  digitalWrite(stepPin, LOW);
+void stepOnceAandRatio_linear() {
+  pulseStepPin(stepPin);
 }
 
-void sendToESP32(const char* message) {
-  Link.println(message);
-  Serial.print(F("[TX] "));
-  Serial.println(message);
+// ==================== SEND TO ESP32 ====================
+static void sendToESP32Line(const char* line) {
+  Link.println(line);
+  Serial.print("[UNO->ESP32] ");
+  Serial.println(line);
 }
 
-void sendStateUpdate() {
-  // Send current state to ESP32
-  char stateMsg[20];
-  snprintf(stateMsg, 20, "STATE:%s", stateLabel(state));
-  sendToESP32(stateMsg);
+static void reportStateToESP32IfChanged() {
+  if (state == lastReportedStateToESP32) return;
+  lastReportedStateToESP32 = state;
+
+  char msg[32];
+  snprintf(msg, sizeof(msg), "STATE:%s", stateName(state));
+  sendToESP32Line(msg);
 }
 
-void resetToHome() {
-  // Reset machine: go backward until distance <= 4.0, then STOP_FWD
-  Serial.println(F("-> RESET: Moving backward to home position"));
-  digitalWrite(dirPin, LOW);
-  state = RUN_BWD;
-  waitingForReset = false;
-  paused = false;
-  emergencyStop = false;
-  digitalWrite(ledPin, LOW);
-  sendStateUpdate(); // Send state update
-  updateLCD();
+static void send01ToESP32(char v01) {
+  if (v01 == '1') digitalWrite(ledPin, HIGH);
+  if (v01 == '0') digitalWrite(ledPin, LOW);
+
+  char msg[2] = { v01, '\0' };
+  sendToESP32Line(msg);
 }
 
-void processCommand(String cmd) {
-  cmd.trim(); // Remove whitespace
-  cmd.toUpperCase(); // Make case-insensitive
-  
-  lastBTTime = millis(); // Update BT connection time
-  
-  Serial.print(F("[RX] "));
-  Serial.println(cmd);
-  
-  if (cmd == "START_FORWARD") {
-    if (!emergencyStop && !paused && !waitingForReset && state == STOP_FWD) {
-      digitalWrite(dirPin, HIGH);
-      digitalWrite(dirPin2, HIGH);
-      state = RUN_FWD;
-      Serial.println(F("-> RUN_FWD"));
-      sendStateUpdate(); // Send state update
-      updateLCD();
-    }
+// ==================== PAUSE/RESUME ====================
+static void doPause() {
+  if (isPaused) return;
+  isPaused = true;
+  pausedState = state;
+  sendToESP32Line("PAUSED");
+  lcdUpdateIfChanged(); // refresh P flag
+}
+
+static void doResume() {
+  if (!isPaused) return;
+  isPaused = false;
+  state = pausedState;
+  lastStepTime = micros();
+  sendToESP32Line("RESUMED");
+  reportStateToESP32IfChanged();
+  lcdUpdateIfChanged(); // refresh P flag
+}
+
+// ==================== COMMANDS FROM ESP32 ====================
+static void handleCommandFromESP32(const char* lineRaw) {
+  char line[80];
+  strncpy(line, lineRaw, sizeof(line) - 1);
+  line[sizeof(line) - 1] = '\0';
+  trimInPlace(line);
+  if (line[0] == '\0') return;
+
+  // handle BLE status messages (BLE:1 / BLE:0) regardless of pause
+  if (strncmp(line, "BLE:", 4) == 0) {
+    char v = line[4];
+    bleConnectedFlag = (v == '1');
+    lcdUpdateIfChanged();
+    return;
   }
-  else if (cmd == "START_BACK") {
-    if (!emergencyStop && !paused && !waitingForReset) {
-      digitalWrite(dirPin, LOW);
-      state = RUN_BWD;
-      Serial.println(F("-> RUN_BWD"));
-      sendStateUpdate(); // Send state update
-      updateLCD();
-    }
+
+  char cmd[80];
+  strncpy(cmd, line, sizeof(cmd) - 1);
+  cmd[sizeof(cmd) - 1] = '\0';
+  toUpperInPlace(cmd);
+
+  Serial.print("[ESP32->UNO] ");
+  Serial.println(line);
+
+  // Always allow LED commands even while paused
+  if (strcmp(cmd, "1") == 0) { digitalWrite(ledPin, HIGH); return; }
+  if (strcmp(cmd, "0") == 0) { digitalWrite(ledPin, LOW);  return; }
+
+  // PAUSE/RESUME must work anytime
+  if (strcmp(cmd, "PAUSE") == 0)  { doPause();  return; }
+  if (strcmp(cmd, "RESUME") == 0) { doResume(); return; }
+
+  // If paused: ignore other motion/state commands until RESUME or button
+  if (isPaused) return;
+
+  if (strcmp(cmd, "START_FORWARD") == 0) {
+    digitalWrite(dirPin, HIGH);
+    digitalWrite(dirPin2, HIGH);
+    state = RUN_FWD;
+    resetLockoutUntil = 0;
+    lastStepTime = micros();
+
+    lastShownState = (State)(-1);
+    lcdUpdateIfChanged();
+    reportStateToESP32IfChanged();
+    return;
   }
-  else if (cmd == "US_STOP_FOR") {
-    if (state == RUN_FWD) {
-      state = STOP_BWD;
-      Serial.println(F("-> STOP_BWD (US stop)"));
-      sendStateUpdate(); // Send state update
-      updateLCD();
-    }
+
+  if (strcmp(cmd, "START_BACK") == 0 || strcmp(cmd, "RESET") == 0) {
+    forceResetToBackward();
+    resetLockoutUntil = millis() + resetLockoutMs;
+
+    lastShownState = (State)(-1);
+    lcdUpdateIfChanged();
+    reportStateToESP32IfChanged();
+    return;
   }
-  else if (cmd == "US_STOP_BACK") {
-    if (state == RUN_BWD) {
-      state = STOP_FWD;
-      Serial.println(F("-> STOP_FWD (US stop)"));
-      sendStateUpdate(); // Send state update
-      updateLCD();
-    }
+
+  if (strcmp(cmd, "US_STOP_FOR") == 0) {
+    state = STOP_FWD;
+    lastShownState = (State)(-1);
+    lcdUpdateIfChanged();
+    reportStateToESP32IfChanged();
+    return;
   }
-  else if (cmd == "RESET" || cmd == "RESUME") {
-    // Resume/Reset: reset machine to home position
-    if (waitingForReset || paused || emergencyStop) {
-      resetToHome(); // resetToHome() already sends state update
-    }
+
+  if (strcmp(cmd, "US_STOP_BACK") == 0) {
+    state = STOP_BWD;
+    lastShownState = (State)(-1);
+    lcdUpdateIfChanged();
+    reportStateToESP32IfChanged();
+    return;
   }
-  else if (cmd == "EMERGENCY_STOP" || cmd == "PAUSE") {
-    // Pause/Error: stop everything and wait for button press or resume
-    paused = true;
-    waitingForReset = true;
-    emergencyStop = true;
-    digitalWrite(ledPin, HIGH);
-    Serial.println(F("-> PAUSE/ERROR: Waiting for reset"));
-    sendStateUpdate(); // Send current state (machine is paused but state remains)
-    updateLCD();
-  }
-  else {
-    Serial.print(F("Unknown command: "));
-    Serial.println(cmd);
+
+  if (strcmp(cmd, "EMERGENCY_STOP") == 0) {
+    if (state == RUN_FWD) state = STOP_FWD;
+    else if (state == RUN_BWD) state = STOP_BWD;
+
+    lastShownState = (State)(-1);
+    lcdUpdateIfChanged();
+    reportStateToESP32IfChanged();
+    return;
   }
 }
 
-void pollESP32() {
-  while (Link.available()) {
-    char c = (char)Link.read();
-    
+// ==================== IO POLLS ====================
+static void pollUsbToEsp32() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
     if (c == '\n' || c == '\r') {
-      // End of command
-      if (cmdBuffer.length() > 0) {
-        processCommand(cmdBuffer);
-        cmdBuffer = "";
+      if (usbLen > 0) {
+        usbBuf[usbLen] = '\0';
+        trimInPlace(usbBuf);
+
+        if (usbBuf[0] != '\0') {
+          if (strcmp(usbBuf, "1") == 0) send01ToESP32('1');
+          else if (strcmp(usbBuf, "0") == 0) send01ToESP32('0');
+          else sendToESP32Line(usbBuf);
+        }
+        usbLen = 0;
       }
     } else if (c >= 32 && c <= 126) {
-      // Printable character, add to buffer
-      if (cmdBuffer.length() < MAX_CMD_LEN) {
-        cmdBuffer += c;
-      } else {
-        // Buffer overflow, reset
-        cmdBuffer = "";
-      }
+      if (usbLen < sizeof(usbBuf) - 1) usbBuf[usbLen++] = c;
     }
   }
 }
 
+static void pollEsp32ToUno() {
+  while (Link.available()) {
+    char c = (char)Link.read();
+
+    // ESP32 may send single-byte '1'/'0' without newline
+    if (c == '1' || c == '0') {
+      char tmp[2] = { c, '\0' };
+      handleCommandFromESP32(tmp);
+      continue;
+    }
+
+    if (c == '\n' || c == '\r') {
+      if (linkLen > 0) {
+        linkBuf[linkLen] = '\0';
+        handleCommandFromESP32(linkBuf);
+        linkLen = 0;
+      }
+    } else if (c >= 32 && c <= 126) {
+      if (linkLen < sizeof(linkBuf) - 1) linkBuf[linkLen++] = c;
+    }
+  }
+}
+
+static void pollButtonEvent() {
+  bool level = (digitalRead(buttonPin) == HIGH); // HIGH idle, LOW pressed
+  unsigned long nowMs = millis();
+
+  if (lastButtonLevel == HIGH && level == LOW) {
+    if (nowMs - lastButtonEdgeMs > buttonDebounceMs) {
+      buttonEvent = true;
+      lastButtonEdgeMs = nowMs;
+    }
+  }
+  lastButtonLevel = level;
+}
+
+// -------------------- SETUP --------------------
 void setup() {
   pinMode(dirPin, OUTPUT);
   pinMode(stepPin, OUTPUT);
   pinMode(dirPin2, OUTPUT);
   pinMode(stepPin2, OUTPUT);
+
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
+
   pinMode(buttonPin, INPUT_PULLUP);
   pinMode(ledPin, OUTPUT);
 
-  Serial.begin(115200);  // Serial Monitor at 115200 for faster output
-  Link.begin(9600);      // ESP32 Bluetooth at 9600
+  digitalWrite(stepPin, LOW);
+  digitalWrite(stepPin2, LOW);
 
-  // Initialize LCD
-  lcd.init();
-  lcd.backlight();
-  updateLCD(); // Initial display
+  Serial.begin(115200);
+  Link.begin(LINK_BAUD);
 
   digitalWrite(dirPin, HIGH);
   digitalWrite(dirPin2, HIGH);
-  
-  Serial.println(F("=== Wood Winder System ==="));
-  Serial.println(F("BT Protocol Ready"));
-  Serial.println(F("Commands: START_FORWARD, START_BACK"));
-  Serial.println(F("         US_STOP_FOR, US_STOP_BACK"));
-  Serial.println(F("         RESET, EMERGENCY_STOP"));
-  Serial.println(F("Sends: CV_STOP, STATE:xxx"));
-  
-  delay(500); // Wait for ESP32 to be ready
-  sendStateUpdate(); // Send initial state
+
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+
+  lastShownState = (State)(-1);
+  lastShownDistMm = -1;
+  lastShownBle = -1;
+  lastShownPaused = -1;
+
+  lcdUpdateIfChanged();
+
+  sendToESP32Line("UNO_READY");
+  reportStateToESP32IfChanged();
+  lastStepTime = micros();
 }
 
+// -------------------- LOOP --------------------
 void loop() {
-  pollESP32();
+  pollUsbToEsp32();
+  pollEsp32ToUno();
+  pollButtonEvent();
 
-  // Update LCD periodically to check BT status
-  static unsigned long lastLCDUpdate = 0;
-  if (millis() - lastLCDUpdate >= 500) {
-    updateLCD();
-    lastLCDUpdate = millis();
+  // If paused: freeze machine, but still allow BLE status updates + button unpause
+  if (isPaused) {
+    if (buttonEvent) {
+      buttonEvent = false;
+
+      isPaused = false;
+      pausedState = STOP_FWD;
+      state = STOP_FWD;
+
+      digitalWrite(dirPin, HIGH);
+      digitalWrite(dirPin2, HIGH);
+      resetLockoutUntil = 0;
+
+      lastShownState = (State)(-1);
+      lcdUpdateIfChanged();
+
+      sendToESP32Line("UNPAUSE_BTN");
+      reportStateToESP32IfChanged();
+    }
+    return;
   }
 
+  // Normal button behavior
+  if (buttonEvent) {
+    buttonEvent = false;
+    unsigned long nowMs = millis();
+
+    if (state != STOP_FWD) {
+      forceResetToBackward();
+      resetLockoutUntil = nowMs + resetLockoutMs;
+    } else {
+      digitalWrite(dirPin, HIGH);
+      digitalWrite(dirPin2, HIGH);
+      state = RUN_FWD;
+      resetLockoutUntil = 0;
+      lastStepTime = micros();
+    }
+
+    lastShownState = (State)(-1);
+    lcdUpdateIfChanged();
+    reportStateToESP32IfChanged();
+    return;
+  }
+
+  // Periodic distance read
   unsigned long currentMillis = millis();
   if (currentMillis - previousSensorMillis >= sensorInterval) {
     previousSensorMillis = currentMillis;
-    dist = getDistance();
-    updateLCD(); // Update LCD when distance is read
+
+    dist_cm = getDistanceCm();
+    dist_mm = (long)(dist_cm * 10.0f + 0.5f);
+    lcdUpdateIfChanged();
   }
-  
-  // Check for double press first - triggers reset in ANY state
-  if(isDoublePress()){
-    Serial.println(F("Double press detected - RESET"));
-    resetToHome();
-  }
-  
-  switch(state){
+
+  // State machine based on distance
+  State prevState = state;
+
+  switch (state) {
     case STOP_FWD:
-      Serial.println("STOP FWD MODE");
-      // If waiting for reset after error, button press triggers reset
-      if(buttonPressed() && waitingForReset){
-        resetToHome();
-      }
-      // Normal operation: button press starts forward
-      else if(buttonPressed() && !paused && !emergencyStop && !waitingForReset){
-        digitalWrite(dirPin, HIGH);
-        digitalWrite(dirPin2, HIGH);
-        state = RUN_FWD;
-        sendStateUpdate(); // Send state update
-        updateLCD(); // Update LCD on state change
-      }
       break;
-
     case RUN_FWD:
-      Serial.println("RUN FWD mode");
-      if(dist >= 10.5){
-        state = STOP_BWD;
-        sendToESP32("CV_STOP"); // Send computer vision stop signal
-        sendStateUpdate(); // Send state update
-        updateLCD(); // Update LCD on state change
-      }
-      // Button press during forward movement triggers reset (if not already waiting)
-      if(buttonPressed() && !waitingForReset){
-        resetToHome();
-      }
-      // If waiting for reset, button press also triggers reset
-      else if(buttonPressed() && waitingForReset){
-        resetToHome();
-      }
+      if (dist_cm >= 9.0f) state = STOP_BWD;
       break;
-
     case STOP_BWD:
-      Serial.println("STOP BWD MODE");
-      // If waiting for reset after error, button press triggers reset
-      if(buttonPressed() && waitingForReset){
-        resetToHome();
-      }
-      // Normal operation: button press starts backward
-      else if(buttonPressed() && !paused && !emergencyStop && !waitingForReset){
-        digitalWrite(dirPin, LOW);
-        //digitalWrite(dirPin2, LOW);
-
-        state = RUN_BWD;
-        sendStateUpdate(); // Send state update
-        updateLCD(); // Update LCD on state change
-      }
       break;
-
     case RUN_BWD:
-      Serial.println("RUN BWD MODE");
-      // Check if we've reached home position (dist <= 4.0)
-      if(dist <= 4.0){
-        digitalWrite(dirPin, HIGH);
-        digitalWrite(dirPin2, HIGH);
-        state = STOP_FWD;
-        waitingForReset = false; // Reset complete
-        emergencyStop = false;
-        paused = false;
-        digitalWrite(ledPin, LOW);
-        Serial.println(F("-> RESET complete: At home position (STOP_FWD)"));
-        sendStateUpdate(); // Send state update
-        updateLCD(); // Update LCD on state change
-      }
-      // Button press during backward movement also triggers reset (redundant but safe)
-      if(buttonPressed() && waitingForReset){
-        // Already resetting, just continue
-      }
+      if (millis() >= resetLockoutUntil && dist_cm <= 4.0f) state = STOP_FWD;
       break;
   }
 
-  // Stepping logic: allow backward during reset, but prevent forward when waiting for reset
-  if(!paused && !emergencyStop && (state == RUN_FWD || state == RUN_BWD)){
-    // Don't step forward if waiting for reset
-    if(state == RUN_FWD && waitingForReset){
-      // Blocked: waiting for reset
-    }
-    else {
-      unsigned long now = micros();
+  if (state != prevState) {
+    lastShownState = (State)(-1);
+    lcdUpdateIfChanged();
+    reportStateToESP32IfChanged();
+  }
 
-      if(now - lastStepTime >= stepRate && state == RUN_FWD){
-        lastStepTime = now;
-        stepOnceAandRatio();
-      }else if(now - lastStepTime >= stepRate && state == RUN_BWD){
-        lastStepTime = now;
-        stepOnceAandRatio_linear();
-      }
+  // Stepping
+  if (state == RUN_FWD || state == RUN_BWD) {
+    unsigned long now = micros();
+    if (now - lastStepTime >= stepRate) {
+      lastStepTime += stepRate;
+      if (state == RUN_FWD) stepOnceAandRatio();
+      else                 stepOnceAandRatio_linear();
     }
   }
 }
